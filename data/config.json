@@ -1,1 +1,14 @@
-
+{
+    "bot_token": "8314875678:AAHOM7Um61xQ4fTeXOjCjV9DCPXSbl80Hdc",
+    "owner_id": 5376199311,
+    "admin_ids": [123456789],
+    "your_username": "@xeryzs",
+    "update_channel": "https://t.me/Yuki_channelll",
+    "limits": {
+        "free_user": 2,
+        "subscribed_user": 15,
+        "admin": 999
+    },
+    "max_file_size_mb": 20,
+    "allowed_extensions": [".py", ".js", ".zip"]
+}
