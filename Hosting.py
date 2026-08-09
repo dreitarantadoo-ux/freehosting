@@ -641,18 +641,20 @@ def run_js_script(script_path, owner_id, user_folder, file_name, msg_obj, attemp
 #  ZIP HANDLER
 # ============================================================
 def _launch_entry_point(user_id, user_folder, entry_base, all_bases, message):
-    """Start only the chosen entry point; save all extracted files."""
+    """Start only the chosen entry point; only register THAT file in user_files."""
+    # Stop any currently running scripts from this zip (in case of re-upload)
     for base in all_bases:
-        ft = 'py' if base.endswith('.py') else 'js'
         sk = f"{user_id}_{base}"
         if is_bot_running(user_id, base):
             kill_process_tree(bot_scripts[sk])
             del bot_scripts[sk]
             time.sleep(0.3)
-        save_user_file(user_id, base, ft)
+
+    # Only register the chosen entry point — not the other scripts
+    ft = 'py' if entry_base.endswith('.py') else 'js'
+    save_user_file(user_id, entry_base, ft)
 
     fp = os.path.join(user_folder, entry_base)
-    ft = 'py' if entry_base.endswith('.py') else 'js'
     if os.path.exists(fp):
         if ft == 'py':
             threading.Thread(target=run_script,
@@ -1228,24 +1230,23 @@ def _logic_send_all_files_zip(call):
     if not user_files:
         bot.send_message(chat_id, "📂 No user files found on the server."); return
 
-    status_msg = bot.send_message(chat_id, "⏳ Collecting all user files and creating ZIP...", parse_mode='Markdown')
+    status_msg = bot.send_message(chat_id,
+        f"⏳ Preparing individual ZIPs for {len(user_files)} user(s)...", parse_mode='Markdown')
 
+    tmp_zips = []
     try:
-        tmp_zip_path = os.path.join(DATA_DIR, f"all_files_{int(time.time())}.zip")
-        total_added = 0
-        skipped = 0
+        for owner_id, files in dict(user_files).items():
+            user_folder = get_user_folder(owner_id)
+            tmp_zip_path = os.path.join(DATA_DIR, f"user_{owner_id}_{int(time.time())}.zip")
+            tmp_zips.append(tmp_zip_path)
+            total_added = 0
+            skipped = 0
 
-        with zipfile.ZipFile(tmp_zip_path, 'w', zipfile.ZIP_DEFLATED) as zf:
-            # Include all files from every user's folder
-            for owner_id, files in dict(user_files).items():
-                user_folder = get_user_folder(owner_id)
-                # Walk the entire user folder so we capture everything (scripts, logs, etc.)
+            with zipfile.ZipFile(tmp_zip_path, 'w', zipfile.ZIP_DEFLATED) as zf:
                 for root, dirs, filenames in os.walk(user_folder):
                     for fname in filenames:
                         full_path = os.path.join(root, fname)
-                        # Arc name: user_<id>/<relative path inside user folder>
-                        rel_path = os.path.relpath(full_path, UPLOAD_BOTS_DIR)
-                        arc_name = f"user_{owner_id}/{os.path.relpath(full_path, user_folder)}"
+                        arc_name = os.path.relpath(full_path, user_folder)
                         try:
                             zf.write(full_path, arc_name)
                             total_added += 1
@@ -1253,48 +1254,48 @@ def _logic_send_all_files_zip(call):
                             logger.warning(f"Skipped {full_path}: {fe}")
                             skipped += 1
 
-            # Also bundle the DB and config so owner gets a full backup
-            for extra in [DATABASE_PATH, CONFIG_PATH]:
-                if os.path.exists(extra):
-                    try:
-                        zf.write(extra, f"data/{os.path.basename(extra)}")
-                    except Exception as fe:
-                        logger.warning(f"Skipped {extra}: {fe}")
-
-        zip_size = os.path.getsize(tmp_zip_path)
-        caption = (
-            f"📦 *All User Files Archive*\n\n"
-            f"👥 Users: `{len(user_files)}`\n"
-            f"📄 Files added: `{total_added}`\n"
-            f"⚠️ Skipped: `{skipped}`\n"
-            f"💾 ZIP size: `{_fmt_bytes(zip_size)}`\n"
-            f"🕐 Generated: `{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}`"
-        )
-
-        bot.edit_message_text("📤 Uploading ZIP to Telegram...", chat_id, status_msg.message_id)
-
-        with open(tmp_zip_path, 'rb') as zf_send:
-            bot.send_document(
-                chat_id,
-                zf_send,
-                caption=caption,
-                parse_mode='Markdown',
-                visible_file_name=f"all_user_files_{datetime.now().strftime('%Y%m%d_%H%M%S')}.zip"
+            zip_size = os.path.getsize(tmp_zip_path)
+            file_names = ', '.join(f[0] for f in files)
+            caption = (
+                f"📦 *User Files — `{owner_id}`*\n\n"
+                f"📄 Files: `{file_names}`\n"
+                f"📁 Items in ZIP: `{total_added}`\n"
+                f"⚠️ Skipped: `{skipped}`\n"
+                f"💾 ZIP size: `{_fmt_bytes(zip_size)}`\n"
+                f"🕐 Generated: `{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}`"
             )
 
-        bot.delete_message(chat_id, status_msg.message_id)
+            try:
+                bot.edit_message_text(
+                    f"📤 Uploading ZIP for user `{owner_id}`...", chat_id, status_msg.message_id,
+                    parse_mode='Markdown'
+                )
+            except: pass
+
+            with open(tmp_zip_path, 'rb') as zf_send:
+                bot.send_document(
+                    chat_id,
+                    zf_send,
+                    caption=caption,
+                    parse_mode='Markdown',
+                    visible_file_name=f"user_{owner_id}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.zip"
+                )
+
+        bot.edit_message_text(
+            f"✅ Sent {len(user_files)} ZIP(s) — one per user.", chat_id, status_msg.message_id
+        )
 
     except Exception as e:
         logger.error(f"send_all_files_zip error: {e}", exc_info=True)
         try:
-            bot.edit_message_text(f"❌ Failed to create ZIP: {e}", chat_id, status_msg.message_id)
+            bot.edit_message_text(f"❌ Failed: {e}", chat_id, status_msg.message_id)
         except: pass
     finally:
-        # Clean up temp zip
-        try:
-            if os.path.exists(tmp_zip_path):
-                os.remove(tmp_zip_path)
-        except: pass
+        for p in tmp_zips:
+            try:
+                if os.path.exists(p):
+                    os.remove(p)
+            except: pass
 
 
 # ============================================================
@@ -1479,6 +1480,18 @@ def callback_router(call):
             _parse_and_stop(call, cid[len('stop_'):])
         elif cid.startswith('restart_'):
             _parse_and_restart(call, cid[len('restart_'):])
+        elif cid.startswith('delete_all_'):
+            owner_id, file_name = _split_owner_file(cid[len('delete_all_'):])
+            uid = call.from_user.id
+            if not (uid == owner_id or uid in admin_ids):
+                bot.answer_callback_query(call.id, "Permission denied.", show_alert=True); return
+            _do_delete_file(call, owner_id, file_name, delete_extras=True)
+        elif cid.startswith('delete_only_'):
+            owner_id, file_name = _split_owner_file(cid[len('delete_only_'):])
+            uid = call.from_user.id
+            if not (uid == owner_id or uid in admin_ids):
+                bot.answer_callback_query(call.id, "Permission denied.", show_alert=True); return
+            _do_delete_file(call, owner_id, file_name, delete_extras=False)
         elif cid.startswith('delete_'):
             _parse_and_delete(call, cid[len('delete_'):])
         elif cid.startswith('logs_'):
@@ -1604,23 +1617,99 @@ def _parse_and_restart(call, data):
     elif ft == 'js':
         threading.Thread(target=run_js_script, args=(fp, owner_id, user_folder, file_name, call.message)).start()
 
+def _get_associated_files(owner_id, file_name):
+    """Return list of extra files in user folder not registered as user files."""
+    user_folder = get_user_folder(owner_id)
+    registered = {f[0] for f in user_files.get(owner_id, [])}
+    base_stem = os.path.splitext(file_name)[0]
+    extras = []
+    try:
+        for fname in os.listdir(user_folder):
+            if fname == file_name: continue
+            if fname in registered: continue
+            fp = os.path.join(user_folder, fname)
+            if os.path.isfile(fp):
+                extras.append(fname)
+    except: pass
+    return extras
+
 def _parse_and_delete(call, data):
     owner_id, file_name = _split_owner_file(data)
     uid = call.from_user.id
     if not (uid == owner_id or uid in admin_ids):
         bot.answer_callback_query(call.id, "Permission denied.", show_alert=True); return
+
+    # Check for associated/generated files
+    extras = _get_associated_files(owner_id, file_name)
+    log_file = f"{os.path.splitext(file_name)[0]}.log"
+    # Always include the log if it exists (even if already in extras)
+    user_folder = get_user_folder(owner_id)
+    all_extras = list(dict.fromkeys(
+        ([log_file] if os.path.exists(os.path.join(user_folder, log_file)) else []) +
+        [f for f in extras if f != log_file]
+    ))
+
+    if all_extras:
+        # Ask if user wants to also delete associated files
+        bot.answer_callback_query(call.id)
+        extras_list = '\n'.join(f"  • `{f}`" for f in all_extras)
+        prompt = (
+            f"🗑 Delete `{file_name}`?\n\n"
+            f"These associated files were also found:\n{extras_list}\n\n"
+            f"Do you want to delete them too?"
+        )
+        mk = types.InlineKeyboardMarkup(row_width=1)
+        mk.add(
+            types.InlineKeyboardButton(
+                '🗑 Delete script + associated files',
+                callback_data=f'delete_all_{owner_id}_{file_name}'
+            ),
+            types.InlineKeyboardButton(
+                '🗑 Delete script only',
+                callback_data=f'delete_only_{owner_id}_{file_name}'
+            ),
+            types.InlineKeyboardButton('❌ Cancel', callback_data='check_files'),
+        )
+        try:
+            bot.edit_message_text(prompt, call.message.chat.id, call.message.message_id,
+                                  parse_mode='Markdown', reply_markup=mk)
+        except:
+            bot.send_message(call.message.chat.id, prompt, parse_mode='Markdown', reply_markup=mk)
+    else:
+        # No extras — just delete directly
+        _do_delete_file(call, owner_id, file_name, delete_extras=False)
+
+def _do_delete_file(call, owner_id, file_name, delete_extras=False):
     key = f"{owner_id}_{file_name}"
     if key in bot_scripts: kill_process_tree(bot_scripts[key]); del bot_scripts[key]
     user_folder = get_user_folder(owner_id)
-    for fn in [file_name, f"{os.path.splitext(file_name)[0]}.log"]:
+
+    # Always delete the main file + its log
+    log_file = f"{os.path.splitext(file_name)[0]}.log"
+    to_delete = [file_name, log_file]
+
+    if delete_extras:
+        extras = _get_associated_files(owner_id, file_name)
+        to_delete += [f for f in extras if f not in to_delete]
+
+    for fn in to_delete:
         fp = os.path.join(user_folder, fn)
         if os.path.exists(fp):
             try: os.remove(fp)
             except: pass
+
     remove_user_file_db(owner_id, file_name)
-    bot.answer_callback_query(call.id, f"Deleted {file_name}.")
+
+    deleted_str = ', '.join(f'`{f}`' for f in to_delete if os.path.exists(os.path.join(user_folder, f)) is False)
+    summary = f"🗑 `{file_name}` deleted."
+    if delete_extras and len(to_delete) > 2:
+        summary += f"\nAlso removed {len(to_delete) - 1} associated file(s)."
+
     try:
-        bot.edit_message_text(f"🗑 `{file_name}` deleted.", call.message.chat.id,
+        bot.answer_callback_query(call.id, f"Deleted {file_name}.")
+    except: pass
+    try:
+        bot.edit_message_text(summary, call.message.chat.id,
                               call.message.message_id, parse_mode='Markdown')
     except: pass
 
@@ -2036,49 +2125,56 @@ def cmd_sendallzip(message):
     status_msg = bot.reply_to(message, "⏳ Collecting all user files and creating ZIP...")
 
     def _run():
+        tmp_zips = []
         try:
-            tmp_zip_path = os.path.join(DATA_DIR, f"all_files_{int(time.time())}.zip")
-            total_added = 0
-            skipped = 0
-            with zipfile.ZipFile(tmp_zip_path, 'w', zipfile.ZIP_DEFLATED) as zf:
-                for owner_id, files in dict(user_files).items():
-                    user_folder = get_user_folder(owner_id)
+            for owner_id, files in dict(user_files).items():
+                user_folder = get_user_folder(owner_id)
+                tmp_zip_path = os.path.join(DATA_DIR, f"user_{owner_id}_{int(time.time())}.zip")
+                tmp_zips.append(tmp_zip_path)
+                total_added = 0
+                skipped = 0
+                with zipfile.ZipFile(tmp_zip_path, 'w', zipfile.ZIP_DEFLATED) as zf:
                     for root, dirs, filenames in os.walk(user_folder):
                         for fname in filenames:
                             full_path = os.path.join(root, fname)
-                            arc_name = f"user_{owner_id}/{os.path.relpath(full_path, user_folder)}"
+                            arc_name = os.path.relpath(full_path, user_folder)
                             try:
                                 zf.write(full_path, arc_name)
                                 total_added += 1
                             except Exception as fe:
                                 logger.warning(f"Skipped {full_path}: {fe}")
                                 skipped += 1
-                for extra in [DATABASE_PATH, CONFIG_PATH]:
-                    if os.path.exists(extra):
-                        try: zf.write(extra, f"data/{os.path.basename(extra)}")
-                        except: pass
-            zip_size = os.path.getsize(tmp_zip_path)
-            caption = (
-                f"📦 *All User Files Archive*\n\n"
-                f"👥 Users: `{len(user_files)}`\n"
-                f"📄 Files added: `{total_added}`\n"
-                f"⚠️ Skipped: `{skipped}`\n"
-                f"💾 ZIP size: `{_fmt_bytes(zip_size)}`\n"
-                f"🕐 Generated: `{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}`"
+                zip_size = os.path.getsize(tmp_zip_path)
+                file_names = ', '.join(f[0] for f in files)
+                caption = (
+                    f"📦 *User Files — `{owner_id}`*\n\n"
+                    f"📄 Files: `{file_names}`\n"
+                    f"📁 Items in ZIP: `{total_added}`\n"
+                    f"⚠️ Skipped: `{skipped}`\n"
+                    f"💾 ZIP size: `{_fmt_bytes(zip_size)}`\n"
+                    f"🕐 Generated: `{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}`"
+                )
+                try:
+                    bot.edit_message_text(
+                        f"📤 Uploading ZIP for user `{owner_id}`...", chat_id, status_msg.message_id,
+                        parse_mode='Markdown'
+                    )
+                except: pass
+                with open(tmp_zip_path, 'rb') as zf_send:
+                    bot.send_document(chat_id, zf_send, caption=caption, parse_mode='Markdown',
+                                      visible_file_name=f"user_{owner_id}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.zip")
+            bot.edit_message_text(
+                f"✅ Sent {len(user_files)} ZIP(s) — one per user.", chat_id, status_msg.message_id
             )
-            bot.edit_message_text("📤 Uploading ZIP...", chat_id, status_msg.message_id)
-            with open(tmp_zip_path, 'rb') as zf_send:
-                bot.send_document(chat_id, zf_send, caption=caption, parse_mode='Markdown',
-                                  visible_file_name=f"all_user_files_{datetime.now().strftime('%Y%m%d_%H%M%S')}.zip")
-            bot.delete_message(chat_id, status_msg.message_id)
         except Exception as e:
             logger.error(f"sendallzip command error: {e}", exc_info=True)
             try: bot.edit_message_text(f"❌ Failed: {e}", chat_id, status_msg.message_id)
             except: pass
         finally:
-            try:
-                if os.path.exists(tmp_zip_path): os.remove(tmp_zip_path)
-            except: pass
+            for p in tmp_zips:
+                try:
+                    if os.path.exists(p): os.remove(p)
+                except: pass
 
     threading.Thread(target=_run, daemon=True).start()
 
