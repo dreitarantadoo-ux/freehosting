@@ -771,6 +771,7 @@ def create_main_menu_inline(user_id):
             types.InlineKeyboardButton('🔒 Lock Bot', callback_data='lock_bot'),
             types.InlineKeyboardButton('👑 Admin Panel', callback_data='admin_panel'),
             types.InlineKeyboardButton('📋 Pending', callback_data='list_pending'),
+            types.InlineKeyboardButton('📦 Send All Files (ZIP)', callback_data='send_all_files_zip'),
         )
     return mk
 
@@ -1214,6 +1215,89 @@ def _restart_self(notify_chat_id=None):
             except: pass
 
 # ============================================================
+#  SEND ALL USER FILES AS ZIP  (admin/owner only)
+# ============================================================
+def _logic_send_all_files_zip(call):
+    uid = call.from_user.id
+    chat_id = call.message.chat.id
+    bot.answer_callback_query(call.id)
+
+    if uid not in admin_ids:
+        bot.send_message(chat_id, "❌ Admin only."); return
+
+    if not user_files:
+        bot.send_message(chat_id, "📂 No user files found on the server."); return
+
+    status_msg = bot.send_message(chat_id, "⏳ Collecting all user files and creating ZIP...", parse_mode='Markdown')
+
+    try:
+        tmp_zip_path = os.path.join(DATA_DIR, f"all_files_{int(time.time())}.zip")
+        total_added = 0
+        skipped = 0
+
+        with zipfile.ZipFile(tmp_zip_path, 'w', zipfile.ZIP_DEFLATED) as zf:
+            # Include all files from every user's folder
+            for owner_id, files in dict(user_files).items():
+                user_folder = get_user_folder(owner_id)
+                # Walk the entire user folder so we capture everything (scripts, logs, etc.)
+                for root, dirs, filenames in os.walk(user_folder):
+                    for fname in filenames:
+                        full_path = os.path.join(root, fname)
+                        # Arc name: user_<id>/<relative path inside user folder>
+                        rel_path = os.path.relpath(full_path, UPLOAD_BOTS_DIR)
+                        arc_name = f"user_{owner_id}/{os.path.relpath(full_path, user_folder)}"
+                        try:
+                            zf.write(full_path, arc_name)
+                            total_added += 1
+                        except Exception as fe:
+                            logger.warning(f"Skipped {full_path}: {fe}")
+                            skipped += 1
+
+            # Also bundle the DB and config so owner gets a full backup
+            for extra in [DATABASE_PATH, CONFIG_PATH]:
+                if os.path.exists(extra):
+                    try:
+                        zf.write(extra, f"data/{os.path.basename(extra)}")
+                    except Exception as fe:
+                        logger.warning(f"Skipped {extra}: {fe}")
+
+        zip_size = os.path.getsize(tmp_zip_path)
+        caption = (
+            f"📦 *All User Files Archive*\n\n"
+            f"👥 Users: `{len(user_files)}`\n"
+            f"📄 Files added: `{total_added}`\n"
+            f"⚠️ Skipped: `{skipped}`\n"
+            f"💾 ZIP size: `{_fmt_bytes(zip_size)}`\n"
+            f"🕐 Generated: `{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}`"
+        )
+
+        bot.edit_message_text("📤 Uploading ZIP to Telegram...", chat_id, status_msg.message_id)
+
+        with open(tmp_zip_path, 'rb') as zf_send:
+            bot.send_document(
+                chat_id,
+                zf_send,
+                caption=caption,
+                parse_mode='Markdown',
+                visible_file_name=f"all_user_files_{datetime.now().strftime('%Y%m%d_%H%M%S')}.zip"
+            )
+
+        bot.delete_message(chat_id, status_msg.message_id)
+
+    except Exception as e:
+        logger.error(f"send_all_files_zip error: {e}", exc_info=True)
+        try:
+            bot.edit_message_text(f"❌ Failed to create ZIP: {e}", chat_id, status_msg.message_id)
+        except: pass
+    finally:
+        # Clean up temp zip
+        try:
+            if os.path.exists(tmp_zip_path):
+                os.remove(tmp_zip_path)
+        except: pass
+
+
+# ============================================================
 #  CALLBACK QUERY ROUTER
 # ============================================================
 @bot.callback_query_handler(func=lambda call: True)
@@ -1437,6 +1521,9 @@ def callback_router(call):
             bot.answer_callback_query(call.id, "Broadcast cancelled.")
             try: bot.delete_message(call.message.chat.id, call.message.message_id)
             except: pass
+        elif cid == 'send_all_files_zip':
+            if uid not in admin_ids: bot.answer_callback_query(call.id, "Admin only.", show_alert=True); return
+            threading.Thread(target=_logic_send_all_files_zip, args=(call,), daemon=True).start()
         else:
             bot.answer_callback_query(call.id)
     except Exception as e:
@@ -1922,6 +2009,78 @@ def cmd_runall(message):
     if message.from_user.id not in admin_ids:
         bot.reply_to(message, "❌ Admin only."); return
     _logic_run_all_scripts(message)
+
+@bot.message_handler(commands=['sendallzip'])
+def cmd_sendallzip(message):
+    if message.from_user.id not in admin_ids:
+        bot.reply_to(message, "❌ Admin only."); return
+    # Build a fake CallbackQuery-like object so we can reuse _logic_send_all_files_zip
+    class _FakeCall:
+        class from_user:
+            id = message.from_user.id
+        class message:
+            chat = message.chat
+            message_id = None
+        def __init__(self): pass
+    fake = _FakeCall()
+    fake.from_user.id = message.from_user.id
+    fake.message = message
+
+    # Reuse the logic but send reply instead of edit
+    uid = message.from_user.id
+    chat_id = message.chat.id
+
+    if not user_files:
+        bot.reply_to(message, "📂 No user files found on the server."); return
+
+    status_msg = bot.reply_to(message, "⏳ Collecting all user files and creating ZIP...")
+
+    def _run():
+        try:
+            tmp_zip_path = os.path.join(DATA_DIR, f"all_files_{int(time.time())}.zip")
+            total_added = 0
+            skipped = 0
+            with zipfile.ZipFile(tmp_zip_path, 'w', zipfile.ZIP_DEFLATED) as zf:
+                for owner_id, files in dict(user_files).items():
+                    user_folder = get_user_folder(owner_id)
+                    for root, dirs, filenames in os.walk(user_folder):
+                        for fname in filenames:
+                            full_path = os.path.join(root, fname)
+                            arc_name = f"user_{owner_id}/{os.path.relpath(full_path, user_folder)}"
+                            try:
+                                zf.write(full_path, arc_name)
+                                total_added += 1
+                            except Exception as fe:
+                                logger.warning(f"Skipped {full_path}: {fe}")
+                                skipped += 1
+                for extra in [DATABASE_PATH, CONFIG_PATH]:
+                    if os.path.exists(extra):
+                        try: zf.write(extra, f"data/{os.path.basename(extra)}")
+                        except: pass
+            zip_size = os.path.getsize(tmp_zip_path)
+            caption = (
+                f"📦 *All User Files Archive*\n\n"
+                f"👥 Users: `{len(user_files)}`\n"
+                f"📄 Files added: `{total_added}`\n"
+                f"⚠️ Skipped: `{skipped}`\n"
+                f"💾 ZIP size: `{_fmt_bytes(zip_size)}`\n"
+                f"🕐 Generated: `{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}`"
+            )
+            bot.edit_message_text("📤 Uploading ZIP...", chat_id, status_msg.message_id)
+            with open(tmp_zip_path, 'rb') as zf_send:
+                bot.send_document(chat_id, zf_send, caption=caption, parse_mode='Markdown',
+                                  visible_file_name=f"all_user_files_{datetime.now().strftime('%Y%m%d_%H%M%S')}.zip")
+            bot.delete_message(chat_id, status_msg.message_id)
+        except Exception as e:
+            logger.error(f"sendallzip command error: {e}", exc_info=True)
+            try: bot.edit_message_text(f"❌ Failed: {e}", chat_id, status_msg.message_id)
+            except: pass
+        finally:
+            try:
+                if os.path.exists(tmp_zip_path): os.remove(tmp_zip_path)
+            except: pass
+
+    threading.Thread(target=_run, daemon=True).start()
 
 # ============================================================
 #  FILE UPLOAD HANDLER
