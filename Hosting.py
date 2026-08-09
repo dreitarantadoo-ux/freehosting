@@ -640,6 +640,28 @@ def run_js_script(script_path, owner_id, user_folder, file_name, msg_obj, attemp
 # ============================================================
 #  ZIP HANDLER
 # ============================================================
+def _launch_entry_point(user_id, user_folder, entry_base, all_bases, message):
+    """Start only the chosen entry point; save all extracted files."""
+    for base in all_bases:
+        ft = 'py' if base.endswith('.py') else 'js'
+        sk = f"{user_id}_{base}"
+        if is_bot_running(user_id, base):
+            kill_process_tree(bot_scripts[sk])
+            del bot_scripts[sk]
+            time.sleep(0.3)
+        save_user_file(user_id, base, ft)
+
+    fp = os.path.join(user_folder, entry_base)
+    ft = 'py' if entry_base.endswith('.py') else 'js'
+    if os.path.exists(fp):
+        if ft == 'py':
+            threading.Thread(target=run_script,
+                             args=(fp, user_id, user_folder, entry_base, message)).start()
+        else:
+            threading.Thread(target=run_js_script,
+                             args=(fp, user_id, user_folder, entry_base, message)).start()
+
+
 def handle_zip_file(content_bytes, zip_name, message):
     user_id = message.from_user.id
     user_folder = get_user_folder(user_id)
@@ -656,39 +678,68 @@ def handle_zip_file(content_bytes, zip_name, message):
                 return
             zf.extractall(user_folder)
         os.remove(tmp_zip)
+
         script_files = py_files + js_files
+        all_bases = []
         for fn in script_files:
             base = os.path.basename(fn)
-            src = os.path.join(user_folder, fn)
-            dst = os.path.join(user_folder, base)
-            if src != dst:
+            src  = os.path.join(user_folder, fn)
+            dst  = os.path.join(user_folder, base)
+            if src != dst and os.path.exists(src):
                 shutil.move(src, dst)
-            ft = 'py' if base.endswith('.py') else 'js'
+            all_bases.append(base)
 
-            # Auto-replace: stop if already running
-            script_key = f"{user_id}_{base}"
-            if is_bot_running(user_id, base):
-                kill_process_tree(bot_scripts[script_key])
-                del bot_scripts[script_key]
-                time.sleep(0.5)
+        names_str = '\n'.join(
+            f"  {'🐍' if b.endswith('.py') else '🟨'} `{b}`"
+            for b in all_bases
+        )
 
-            save_user_file(user_id, base, ft)
+        # ── Single script → auto-run, no question asked ──────────────────
+        if len(all_bases) == 1:
+            entry = all_bases[0]
+            zip_card = (
+                "╔══════════════════════════════╗\n"
+                "║      ✅  ZIP EXTRACTED        ║\n"
+                "╚══════════════════════════════╝\n\n"
+                f"📦 *Zip:* `{zip_name}`\n"
+                f"📄 *File:* `{entry}`\n\n"
+                "▶️ Auto-starting..."
+            )
+            mk = types.InlineKeyboardMarkup(row_width=1)
+            mk.add(types.InlineKeyboardButton('📂 My Files', callback_data='check_files'))
+            bot.reply_to(message, zip_card, parse_mode='Markdown', reply_markup=mk)
+            _launch_entry_point(user_id, user_folder, entry, all_bases, message)
+            return
 
-        names_str = ', '.join(f'`{os.path.basename(f)}`' for f in script_files)
-        bot.reply_to(message, f"✅ Zip extracted. Found: {names_str}\n▶️ Auto-starting all scripts...",
-                     parse_mode='Markdown')
+        # ── Multiple scripts → ask which one is the entry point ──────────
+        pick_text = (
+            "╔══════════════════════════════╗\n"
+            "║      📦  ZIP EXTRACTED        ║\n"
+            "╚══════════════════════════════╝\n\n"
+            f"*{len(all_bases)} scripts found inside* `{zip_name}`:\n\n"
+            f"{names_str}\n\n"
+            "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+            "⚡ *Which file should be the entry point?*\n"
+            "Tap to select — only that file will be started."
+        )
+        mk = types.InlineKeyboardMarkup(row_width=1)
+        for base in all_bases:
+            icon = '🐍' if base.endswith('.py') else '🟨'
+            mk.add(types.InlineKeyboardButton(
+                f"{icon} {base}",
+                callback_data=f"entrypoint_{user_id}_{base}"
+            ))
+        bot.reply_to(message, pick_text, parse_mode='Markdown', reply_markup=mk)
 
-        # Auto-run all extracted scripts
-        for fn in script_files:
-            base = os.path.basename(fn)
-            fp = os.path.join(user_folder, base)
-            ft = 'py' if base.endswith('.py') else 'js'
-            if os.path.exists(fp):
-                if ft == 'py':
-                    threading.Thread(target=run_script, args=(fp, user_id, user_folder, base, message)).start()
-                else:
-                    threading.Thread(target=run_js_script, args=(fp, user_id, user_folder, base, message)).start()
-                time.sleep(0.5)
+        # Store context so callback can launch it
+        if not hasattr(bot, '_zip_contexts'):
+            bot._zip_contexts = {}
+        bot._zip_contexts[f"{user_id}_{zip_name}"] = {
+            'all_bases': all_bases,
+            'user_folder': user_folder,
+            'message': message,
+        }
+
     except zipfile.BadZipFile:
         bot.reply_to(message, "❌ Invalid zip file.")
         if os.path.exists(tmp_zip): os.remove(tmp_zip)
@@ -933,10 +984,21 @@ def handle_file_upload_doc(message):
 
         with open(file_path, 'wb') as f: f.write(content)
 
-        if was_running:
-            bot.edit_message_text(f"✅ `{doc.file_name}` replaced. Restarting...", chat_id, wait_msg.message_id, parse_mode='Markdown')
-        else:
-            bot.edit_message_text(f"✅ `{doc.file_name}` saved. Starting...", chat_id, wait_msg.message_id, parse_mode='Markdown')
+        _icon = '🐍' if file_ext == '.py' else '🟨' if file_ext == '.js' else '📦'
+        _status = 'replaced & restarting' if was_running else 'deployed & starting'
+        _file_card = (
+            "╔══════════════════════════════╗\n"
+            "║       ✅  FILE UPLOADED       ║\n"
+            "╚══════════════════════════════╝\n\n"
+            f"{_icon} *File:* `{doc.file_name}`\n"
+            f"👤 *Owner:* `{user_id}`\n"
+            f"📦 *Size:* `{_fmt_bytes(doc.file_size)}`\n"
+            f"⚡ *Status:* {_status}\n"
+        )
+        mk_file = types.InlineKeyboardMarkup(row_width=1)
+        mk_file.add(types.InlineKeyboardButton('📂 My Files', callback_data='check_files'))
+        bot.edit_message_text(_file_card, chat_id, wait_msg.message_id,
+                              parse_mode='Markdown', reply_markup=mk_file)
 
         if file_ext == '.zip':
             handle_zip_file(content, doc.file_name, message)
@@ -1160,7 +1222,52 @@ def callback_router(call):
     uid = call.from_user.id
 
     try:
-        if cid == 'back_main':
+        if cid.startswith('entrypoint_'):
+            bot.answer_callback_query(call.id)
+            # format: entrypoint_{user_id}_{filename}
+            parts    = cid.split('_', 2)   # ['entrypoint', user_id, filename]
+            owner_id = int(parts[1])
+            entry    = parts[2]
+
+            # only the owner can pick
+            if uid != owner_id:
+                bot.answer_callback_query(call.id, "⛔ Not your upload.", show_alert=True)
+                return
+
+            ctx_key = None
+            if hasattr(bot, '_zip_contexts'):
+                ctx_key = next((k for k in bot._zip_contexts if k.startswith(f"{owner_id}_")), None)
+
+            if not ctx_key:
+                bot.answer_callback_query(call.id, "⚠️ Session expired. Re-upload the zip.", show_alert=True)
+                return
+
+            ctx         = bot._zip_contexts.pop(ctx_key)
+            all_bases   = ctx['all_bases']
+            user_folder = ctx['user_folder']
+            orig_msg    = ctx['message']
+
+            if entry not in all_bases:
+                bot.answer_callback_query(call.id, "❌ File not found.", show_alert=True)
+                return
+
+            confirm = (
+                "╔══════════════════════════════╗\n"
+                "║     ▶️  LAUNCHING ENTRY POINT  ║\n"
+                "╚══════════════════════════════╝\n\n"
+                f"🚀 *Entry point:* `{entry}`\n"
+                f"📄 *All files saved:* `{len(all_bases)}`\n\n"
+                "Starting now..."
+            )
+            mk_confirm = types.InlineKeyboardMarkup(row_width=1)
+            mk_confirm.add(types.InlineKeyboardButton('📂 My Files', callback_data='check_files'))
+            bot.edit_message_text(
+                confirm, call.message.chat.id, call.message.message_id,
+                parse_mode='Markdown', reply_markup=mk_confirm
+            )
+            _launch_entry_point(owner_id, user_folder, entry, all_bases, orig_msg)
+
+        elif cid == 'back_main':
             back_to_main(call)
         elif cid == 'check_files':
             _logic_check_files(call)
@@ -1168,8 +1275,57 @@ def callback_router(call):
             _logic_see_all_files(call)
         elif cid == 'upload':
             bot.answer_callback_query(call.id)
-            bot.send_message(call.message.chat.id,
-                "📤 Send a `.py`, `.js`, or `.zip` file.", parse_mode='Markdown')
+            upload_guide = (
+                "╔══════════════════════════════╗\n"
+                "║        📤  UPLOAD FILE        ║\n"
+                "╚══════════════════════════════╝\n\n"
+                "Send your file directly to this chat.\n"
+                "Supported: `.py`  `.js`  `.zip`\n\n"
+                "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+                "📦 *ZIP FORMAT GUIDE*\n"
+                "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
+                "Structure your `.zip` like this:\n\n"
+                "```\n"
+                "yourbot.zip\n"
+                "├── main.py            ← REQUIRED (entry point)\n"
+                "├── requirements.txt   ← pip deps (auto-installed)\n"
+                "├── Procfile           ← optional, see format below\n"
+                "├── config.py          ← optional\n"
+                "└── utils/\n"
+                "    └── helper.py      ← optional\n"
+                "```\n\n"
+                "📄 *Procfile format* (inside your zip):\n"
+                "```\n"
+                "worker: python main.py\n"
+                "```\n\n"
+                "📋 *requirements.txt format:*\n"
+                "```\n"
+                "pyTelegramBotAPI\n"
+                "requests\n"
+                "python-dotenv\n"
+                "```\n\n"
+                "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+                "✅ *Rules*\n"
+                "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+                "• Entry point must be named `main.py`\n"
+                "• At least one `.py` or `.js` required\n"
+                "• `requirements.txt` → auto-pip on deploy\n"
+                "• Max size: `20 MB`\n"
+                "• Nested folders fine — auto-flattened\n\n"
+                "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+                "🟡 *Non-admin* → pending admin approval\n"
+                "🟢 *Admin* → instant deploy + auto-start\n"
+                "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
+                "📎 Drop your file here now."
+            )
+            mk_upload = types.InlineKeyboardMarkup(row_width=1)
+            mk_upload.add(types.InlineKeyboardButton('◀️ Back', callback_data='back_main'))
+            bot.send_message(
+                call.message.chat.id,
+                upload_guide,
+                parse_mode='Markdown',
+                reply_markup=mk_upload
+            )
         elif cid == 'stats':
             bot.answer_callback_query(call.id)
             _logic_statistics(call.message)
